@@ -1,2 +1,13 @@
+# secrets
 .env
+.env.*
+!.env.example
+
+# downloaded mail data
 attachments/
+
+# python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
