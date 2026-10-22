@@ -1,0 +1,5 @@
+python-dotenv>=1.0
+pdfplumber>=0.11
+pytesseract>=0.3.10
+pdf2image>=1.17
+anthropic>=2.1
