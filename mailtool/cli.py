@@ -3,8 +3,9 @@
 Examples:
   python mail_tool.py search --subject "Daily Morning Briefing Minutes" --days 2
   python mail_tool.py fetch  --subject "Daily Morning Briefing Minutes" --days 2 --summarize
+  python mail_tool.py fetch  --subject "Night reports" --days 1 --summarize
   python mail_tool.py extract "attachments/2026-10-22/Daily Beriefing 22102026.pdf"
-  python mail_tool.py summarize "attachments/2026-10-22/Daily Beriefing 22102026.pdf"
+  python mail_tool.py summarize "attachments/2026-10-23/Communication Sheet October 2026.xlsx"
 """
 
 from __future__ import annotations
@@ -45,26 +46,27 @@ def _add_pdf_args(p: argparse.ArgumentParser) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="mail_tool", description="Read-only Gmail attachment reader")
+    parser = argparse.ArgumentParser(prog="mail_tool", description="Read-only Gmail attachment reader (PDF, Excel, Word)")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("search", help="list matching emails")
     _add_search_args(p)
 
-    p = sub.add_parser("fetch", help="download attachments of matching emails and extract PDF text")
+    p = sub.add_parser("fetch", help="download attachments of matching emails and extract their text")
     _add_search_args(p)
     _add_pdf_args(p)
-    p.add_argument("--all-types", action="store_true", help="save every attachment, not only PDFs")
+    p.add_argument("--all-types", action="store_true",
+                   help="save every attachment, not only PDF/Excel/Word documents")
     p.add_argument("--summarize", action="store_true",
-                   help="summarize each PDF in Egyptian Arabic (needs ANTHROPIC_API_KEY)")
+                   help="summarize each document in Egyptian Arabic (needs ANTHROPIC_API_KEY)")
     p.add_argument("--output", type=Path, default=DEFAULT_OUTPUT, help="attachments folder")
 
-    p = sub.add_parser("extract", help="extract text from local PDFs")
-    p.add_argument("pdfs", nargs="+", type=Path)
+    p = sub.add_parser("extract", help="extract text from local PDF/Excel/Word files")
+    p.add_argument("files", nargs="+", type=Path)
     _add_pdf_args(p)
 
-    p = sub.add_parser("summarize", help="summarize local PDFs in Egyptian Arabic")
-    p.add_argument("pdfs", nargs="+", type=Path)
+    p = sub.add_parser("summarize", help="summarize local PDF/Excel/Word files in Egyptian Arabic")
+    p.add_argument("files", nargs="+", type=Path)
     return parser
 
 
@@ -87,7 +89,7 @@ def cmd_search(args: argparse.Namespace, settings: Settings) -> None:
 def cmd_fetch(args: argparse.Namespace, settings: Settings) -> None:
     from .attachments import save_attachments
 
-    pdfs: list[tuple[Path, str]] = []
+    documents: list[tuple[Path, str]] = []
     with GmailReader(settings, args.mailbox) as reader:
         uids = reader.search(_criteria(args))[-args.limit:]
         print(f"{len(uids)} matching email(s)")
@@ -95,33 +97,68 @@ def cmd_fetch(args: argparse.Namespace, settings: Settings) -> None:
             msg = reader.fetch(uid)
             subject = str(msg.get("Subject", ""))
             print(f"\n{subject}  ({msg.get('Date', '')})")
-            for item in save_attachments(msg, message_date(msg), args.output, pdf_only=not args.all_types):
+            saved = save_attachments(msg, message_date(msg), args.output,
+                                     documents_only=not args.all_types)
+            for item in saved:
                 state = "already saved" if item.skipped_existing else "saved"
                 print(f"  {state}: {_display(item.path)}")
-                if item.path.suffix.lower() == ".pdf":
-                    pdfs.append((item.path, subject))
+                if is_document(item.path):
+                    documents.append((item.path, subject))
 
-    for path, subject in pdfs:
-        _extract_one(path, args.ocr)
+    for path, subject in documents:
+        text = _extract_one(path, args.ocr)
         if args.summarize:
-            _summarize_one(path, settings, subject)
+            _summarize_one(path, settings, subject, text)
 
 
-def _extract_one(path: Path, ocr: str) -> None:
-    from .pdf_extract import extract_pdf, write_text
+def is_document(path: Path) -> bool:
+    from .attachments import DOCUMENT_SUFFIXES
 
-    pages = extract_pdf(path, ocr=ocr)
-    out = write_text(pages, path.with_suffix(".txt"))
-    methods = ", ".join(f"p{p.number}:{p.method}" for p in pages)
-    print(f"  text → {_display(out)}  [{methods}]")
+    return path.suffix.lower() in DOCUMENT_SUFFIXES
 
 
-def _summarize_one(path: Path, settings: Settings, subject: str = "") -> None:
-    from .summarize import summarize_pdf
+def _extract_one(path: Path, ocr: str) -> str | None:
+    """Write <file>.txt next to the file and return the text (None if unsupported)."""
+    out = path.with_name(path.name + ".txt")
+    if path.suffix.lower() == ".pdf":
+        from .pdf_extract import extract_pdf, write_text
 
-    print(f"  summarizing {path.name} …")
-    summary = summarize_pdf(path, settings, subject)
-    out = path.with_suffix(".summary.md")
+        pages = extract_pdf(path, ocr=ocr)
+        write_text(pages, out)
+        methods = ", ".join(f"p{p.number}:{p.method}" for p in pages)
+        print(f"  text → {_display(out)}  [{methods}]")
+        return None  # PDFs are summarized from the file itself
+    if not is_document(path):
+        print(f"  skipping {path.name}: only PDF, Excel (.xlsx/.xls) and Word (.docx) are supported")
+        return None
+
+    from .office_extract import extract_office
+
+    try:
+        text = extract_office(path)
+    except Exception as exc:  # corrupt or password-protected files
+        print(f"  could not read {path.name}: {exc}")
+        return None
+    out.write_text(text + "\n", encoding="utf-8")
+    print(f"  text → {_display(out)}  [{len(text):,} characters]")
+    return text
+
+
+def _summarize_one(path: Path, settings: Settings, subject: str = "", text: str | None = None) -> None:
+    from .summarize import summarize_pdf, summarize_text
+
+    if path.suffix.lower() == ".pdf":
+        print(f"  summarizing {path.name} …")
+        summary = summarize_pdf(path, settings, subject)
+    else:
+        if text is None:
+            text = _extract_one(path, "auto")
+        if not text or not text.strip():
+            print(f"  nothing to summarize in {path.name}")
+            return
+        print(f"  summarizing {path.name} …")
+        summary = summarize_text(path, text, settings, subject)
+    out = path.with_name(path.name + ".summary.md")
     out.write_text(f"# {subject or path.stem}\n\n{summary}\n", encoding="utf-8")
     print(f"  summary → {_display(out)}\n")
     print(summary)
@@ -138,13 +175,13 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         if args.command == "extract":
-            for pdf in args.pdfs:
-                _extract_one(pdf, args.ocr)
+            for path in args.files:
+                _extract_one(path, args.ocr)
             return 0
         if args.command == "summarize":
             settings = _summary_settings()
-            for pdf in args.pdfs:
-                _summarize_one(pdf, settings)
+            for path in args.files:
+                _summarize_one(path, settings)
             return 0
 
         settings = load_settings()

@@ -122,7 +122,7 @@ def _msg_with(*attachments):
 def test_save_attachments_by_date_pdf_only(tmp_path):
     msg = _msg_with(("../min.pdf", b"%PDF-1.5 a", "application", "pdf"),
                     ("logo.png", b"\x89PNG", "image", "png"))
-    saved = save_attachments(msg, date(2026, 10, 22), tmp_path, pdf_only=True)
+    saved = save_attachments(msg, date(2026, 10, 22), tmp_path, documents_only=True)
     assert [s.path for s in saved] == [tmp_path / "2026-10-22" / "min.pdf"]
     assert saved[0].path.read_bytes() == b"%PDF-1.5 a"
 
@@ -156,3 +156,71 @@ def test_good_arabic_is_not_garbled():
 def test_broken_text_layer_is_garbled():
     text = "ضورة توفن صندوق إسعافات أولية يف جميع المطاعم والبارات مع إعطاء هذا األمر أهمية قصوى " * 2
     assert looks_garbled_arabic(text.replace("مع", "مغ"))
+
+
+# --- Excel / Word -------------------------------------------------------
+
+def _make_xlsx(path):
+    import datetime as dt
+    import openpyxl
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "22.10"
+    ws.append(["Hotel", "Occupancy", "Date"])
+    ws.append(["El Palacio", 99.75, dt.datetime(2026, 10, 22)])
+    ws.append([None, None, None])
+    ws.append(["Palma", 78, None])
+    wb.create_sheet("23.10").append(["ميريت", "85%"])
+    wb.save(path)
+
+
+def test_extract_xlsx_all_sheets(tmp_path):
+    from mailtool.office_extract import extract_office
+
+    path = tmp_path / "report.xlsx"
+    _make_xlsx(path)
+    text = extract_office(path)
+    assert "===== Sheet: 22.10 (3 rows) =====" in text
+    assert "El Palacio\t99.75\t2026-10-22" in text
+    assert "Palma\t78" in text.splitlines()
+    assert "ميريت\t85%" in text
+
+
+def test_xls_name_with_xlsx_content_is_read(tmp_path):
+    from mailtool.office_extract import extract_office
+
+    path = tmp_path / "Competition Analysis.xls"
+    _make_xlsx(path)
+    assert "El Palacio" in extract_office(path)
+
+
+def test_extract_docx_keeps_tables_in_order(tmp_path):
+    import docx
+    from mailtool.office_extract import extract_office
+
+    document = docx.Document()
+    document.add_paragraph("Duty Manager Incident Log 22/10/2026")
+    table = document.add_table(rows=2, cols=3)
+    for cell, value in zip(table.rows[0].cells, ["Time", "Room", "Incident"]):
+        cell.text = value
+    for cell, value in zip(table.rows[1].cells, ["23:40", "1204", "Guest\nlocked out"]):
+        cell.text = value
+    document.add_paragraph("Signed: Night Manager")
+    path = tmp_path / "log.docx"
+    document.save(path)
+
+    text = extract_office(path)
+    assert text.index("Incident Log") < text.index("[table]") < text.index("Signed")
+    assert "23:40\t1204\tGuest locked out" in text
+
+
+def test_save_attachments_keeps_office_documents(tmp_path):
+    msg = _msg_with(
+        ("sheet.xlsx", b"PK..", "application", "vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        ("old.xls", b"\xd0\xcf..", "application", "vnd.ms-excel"),
+        ("log.docx", b"PK..", "application", "vnd.openxmlformats-officedocument.wordprocessingml.document"),
+        ("logo.png", b"\x89PNG", "image", "png"),
+    )
+    saved = save_attachments(msg, date(2026, 10, 23), tmp_path, documents_only=True)
+    assert sorted(s.path.name for s in saved) == ["log.docx", "old.xls", "sheet.xlsx"]

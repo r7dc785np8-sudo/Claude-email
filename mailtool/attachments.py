@@ -11,6 +11,14 @@ from email.message import EmailMessage
 from pathlib import Path
 
 MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
+DOCUMENT_SUFFIXES = {".pdf", ".xlsx", ".xlsm", ".xls", ".docx"}
+_DOCUMENT_TYPES = {
+    "application/pdf",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.ms-excel.sheet.macroenabled.12",
+    "application/vnd.ms-excel",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+}
 _UNSAFE = re.compile(r'[\x00-\x1f\x7f/\\:*?"<>|]')
 
 
@@ -45,7 +53,7 @@ def save_attachments(
     msg: EmailMessage,
     msg_date: date,
     root: Path,
-    pdf_only: bool = False,
+    documents_only: bool = False,
 ) -> list[SavedAttachment]:
     root = root.resolve()
     folder = root / msg_date.isoformat()
@@ -53,8 +61,8 @@ def save_attachments(
     for index, part in enumerate(msg.iter_attachments(), start=1):
         content_type = part.get_content_type()
         filename = safe_filename(part.get_filename(), fallback=f"attachment-{index}")
-        is_pdf = content_type == "application/pdf" or filename.lower().endswith(".pdf")
-        if pdf_only and not is_pdf:
+        is_document = content_type in _DOCUMENT_TYPES or Path(filename).suffix.lower() in DOCUMENT_SUFFIXES
+        if documents_only and not is_document:
             continue
         payload = part.get_payload(decode=True)
         if not payload:
