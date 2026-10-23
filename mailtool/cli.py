@@ -38,6 +38,12 @@ def _add_search_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--mailbox", default="INBOX",
                    help='mailbox to search (default INBOX; e.g. "[Gmail]/All Mail")')
     p.add_argument("--limit", type=int, default=50, help="max emails to process (newest first)")
+    p.add_argument("--query", help='extra Gmail search terms, e.g. "has:attachment filename:xls" (API only)')
+    p.add_argument("--id", dest="ids", action="append", metavar="MESSAGE_ID",
+                   help="process this Gmail message id instead of searching (API only; repeatable)")
+    p.add_argument("--backend", choices=("auto", "imap", "api"), default="auto",
+                   help="IMAP (App Password) or Gmail API (OAuth over HTTPS); auto picks the API "
+                        "when GMAIL_REFRESH_TOKEN is set")
 
 
 def _add_pdf_args(p: argparse.ArgumentParser) -> None:
@@ -67,6 +73,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("summarize", help="summarize local PDF/Excel/Word files in Egyptian Arabic")
     p.add_argument("files", nargs="+", type=Path)
+
+    sub.add_parser("auth", help="one-time Google sign-in for read-only Gmail API access")
     return parser
 
 
@@ -75,12 +83,27 @@ def _criteria(args: argparse.Namespace) -> SearchCriteria:
                           since=args.since, before=args.before, days=args.days)
 
 
+def _reader(args: argparse.Namespace, settings: Settings):
+    use_api = args.backend == "api" or (args.backend == "auto" and settings.has_gmail_api)
+    if use_api:
+        from .gmail_api import GmailApiReader
+
+        return GmailApiReader(settings, args.mailbox, args.query)
+    if args.query or args.ids:
+        raise ConfigError("--query and --id need the Gmail API backend (run `python mail_tool.py auth`)")
+    return GmailReader(settings, args.mailbox)
+
+
+def _message_ids(args: argparse.Namespace, reader) -> list[str]:
+    return list(args.ids) if args.ids else reader.search(_criteria(args), limit=args.limit)
+
+
 def cmd_search(args: argparse.Namespace, settings: Settings) -> None:
-    with GmailReader(settings, args.mailbox) as reader:
-        uids = reader.search(_criteria(args))[-args.limit:]
+    with _reader(args, settings) as reader:
+        uids = _message_ids(args, reader)
         print(f"{len(uids)} matching email(s)")
         for uid in reversed(uids):
-            s = summarize_message(uid, reader.fetch(uid))
+            s = reader.describe(uid) if hasattr(reader, "describe") else summarize_message(uid, reader.fetch(uid))
             print(f"\n[{s.uid}] {s.date}\n  From:    {s.sender}\n  Subject: {s.subject}")
             for name in s.attachments:
                 print(f"  📎 {name}")
@@ -90,8 +113,8 @@ def cmd_fetch(args: argparse.Namespace, settings: Settings) -> None:
     from .attachments import save_attachments
 
     documents: list[tuple[Path, str]] = []
-    with GmailReader(settings, args.mailbox) as reader:
-        uids = reader.search(_criteria(args))[-args.limit:]
+    with _reader(args, settings) as reader:
+        uids = _message_ids(args, reader)
         print(f"{len(uids)} matching email(s)")
         for uid in reversed(uids):
             msg = reader.fetch(uid)
@@ -179,18 +202,23 @@ def main(argv: list[str] | None = None) -> int:
                 _extract_one(path, args.ocr)
             return 0
         if args.command == "summarize":
-            settings = _summary_settings()
+            settings = load_settings()
             for path in args.files:
                 _summarize_one(path, settings)
             return 0
 
         settings = load_settings()
-        if args.command == "search":
+        if args.command == "auth":
+            from .gmail_auth import run_auth_flow
+
+            run_auth_flow(settings.gmail_client_id, settings.gmail_client_secret,
+                          PROJECT_ROOT / ".env", login_hint=settings.imap_user)
+        elif args.command == "search":
             cmd_search(args, settings)
         elif args.command == "fetch":
             cmd_fetch(args, settings)
         return 0
-    except (ConfigError, OSError, ValueError) as exc:
+    except (ConfigError, OSError, ValueError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     except Exception as exc:
@@ -207,14 +235,3 @@ def main(argv: list[str] | None = None) -> int:
             raise
         return 1
 
-
-def _summary_settings() -> Settings:
-    """Summaries don't need the IMAP password, so don't require it."""
-    try:
-        return load_settings()
-    except ConfigError:
-        import os
-        return Settings(imap_user="", imap_password="",
-                        my_name=os.getenv("MY_NAME", Settings.my_name),
-                        my_role=os.getenv("MY_ROLE", Settings.my_role),
-                        anthropic_api_key=os.getenv("ANTHROPIC_API_KEY") or None)

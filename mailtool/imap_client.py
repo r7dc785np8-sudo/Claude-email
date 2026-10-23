@@ -20,7 +20,7 @@ from datetime import date, timedelta
 from email.message import EmailMessage
 from email.utils import parsedate_to_datetime
 
-from .config import IMAP_HOST, IMAP_PORT, Settings
+from .config import IMAP_HOST, IMAP_PORT, ConfigError, Settings
 
 
 class ReadOnlyViolation(Exception):
@@ -120,6 +120,9 @@ def build_search(criteria: SearchCriteria, today: date | None = None) -> tuple[l
 
 class GmailReader:
     def __init__(self, settings: Settings, mailbox: str = "INBOX"):
+        if not settings.has_imap:
+            raise ConfigError("IMAP_USER and IMAP_APP_PASSWORD must be set in .env "
+                              "(copy .env.example to .env and fill it in).")
         self._settings = settings
         self._mailbox = mailbox
         self._conn: ReadOnlyIMAP4_SSL | None = None
@@ -151,7 +154,7 @@ class GmailReader:
             except Exception:
                 pass
 
-    def search(self, criteria: SearchCriteria) -> list[str]:
+    def search(self, criteria: SearchCriteria, limit: int = 50) -> list[str]:
         tokens, literal = build_search(criteria)
         assert self._conn is not None
         if literal is not None:
@@ -161,7 +164,8 @@ class GmailReader:
             status, data = self._conn.uid("SEARCH", *tokens)
         if status != "OK":
             raise RuntimeError("IMAP search failed")
-        return data[0].decode().split() if data and data[0] else []
+        uids = data[0].decode().split() if data and data[0] else []
+        return uids[-limit:]
 
     def fetch(self, uid: str) -> EmailMessage:
         assert self._conn is not None

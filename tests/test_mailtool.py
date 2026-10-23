@@ -224,3 +224,104 @@ def test_save_attachments_keeps_office_documents(tmp_path):
     )
     saved = save_attachments(msg, date(2026, 10, 23), tmp_path, documents_only=True)
     assert sorted(s.path.name for s in saved) == ["log.docx", "old.xls", "sheet.xlsx"]
+
+
+# --- Gmail API backend ----------------------------------------------------
+
+import base64 as _b64
+import io as _io
+import json as _json
+
+
+def test_gmail_query_from_filters():
+    from mailtool.gmail_api import build_query
+
+    q = build_query(SearchCriteria(sender="reservation.elpalacio@sunnydaysegypt.com",
+                                   subject="Daily B.O.B.", since=date(2026, 10, 23)),
+                    raw_query="has:attachment")
+    assert q == ('in:inbox from:(reservation.elpalacio@sunnydaysegypt.com) '
+                 'subject:("Daily B.O.B.") after:2026/10/22 has:attachment')
+
+
+def test_gmail_query_all_mail_and_before():
+    from mailtool.gmail_api import build_query
+
+    q = build_query(SearchCriteria(before=date(2026, 10, 1)), mailbox="[Gmail]/All Mail")
+    assert q == "before:2026/10/01"
+
+
+def _api_settings():
+    return Settings(gmail_client_id="cid", gmail_client_secret="csecret", gmail_refresh_token="rtoken")
+
+
+class _FakeGoogle:
+    """Answers the three Gmail calls the reader makes; records every request."""
+
+    def __init__(self, raw_message: bytes, scope="https://www.googleapis.com/auth/gmail.readonly"):
+        self.requests = []
+        self.raw = raw_message
+        self.scope = scope
+
+    def __call__(self, req, timeout=None):
+        self.requests.append(req)
+        url = req.full_url
+        if url.startswith("https://oauth2.googleapis.com/token"):
+            body = {"access_token": "atoken", "scope": self.scope}
+        elif "/messages?" in url:
+            body = {"messages": [{"id": "new"}, {"id": "old"}]}
+        elif url.endswith("format=raw"):
+            body = {"raw": _b64.urlsafe_b64encode(self.raw).decode().rstrip("=")}
+        else:
+            raise AssertionError(url)
+        return _io.BytesIO(_json.dumps(body).encode())
+
+
+def test_gmail_api_reader_downloads_large_attachment(monkeypatch, tmp_path):
+    from mailtool.gmail_api import GmailApiReader
+
+    big = b"%PDF-1.5 " + b"x" * (12 * 2**20)  # bigger than the chat connector can carry
+    raw = _msg_with(("BOB report Vs. Last Year 2026.xls", big, "application", "vnd.ms-excel")).as_bytes()
+    google = _FakeGoogle(raw)
+    monkeypatch.setattr("urllib.request.urlopen", google)
+
+    with GmailApiReader(_api_settings()) as reader:
+        ids = reader.search(SearchCriteria(subject="B.O.B", days=1), limit=10)
+        assert ids == ["old", "new"]  # oldest first, like IMAP
+        msg = reader.fetch("new")
+    saved = save_attachments(msg, date(2026, 10, 23), tmp_path, documents_only=True)
+    assert saved[0].path.read_bytes() == big
+    # Read-only: every Gmail call is a GET; only the token exchange POSTs.
+    gmail_calls = [r for r in google.requests if "gmail.googleapis.com" in r.full_url]
+    assert gmail_calls and all(r.get_method() == "GET" for r in gmail_calls)
+
+
+def test_gmail_api_rejects_token_with_write_scope(monkeypatch):
+    from mailtool.gmail_api import GmailApiReader
+
+    monkeypatch.setattr("urllib.request.urlopen",
+                        _FakeGoogle(b"", scope="https://www.googleapis.com/auth/gmail.modify"))
+    with pytest.raises(PermissionError):
+        GmailApiReader(_api_settings()).__enter__()
+
+
+def test_gmail_api_needs_credentials():
+    from mailtool.config import ConfigError
+    from mailtool.gmail_api import GmailApiReader
+
+    with pytest.raises(ConfigError):
+        GmailApiReader(Settings())
+
+
+def test_api_secrets_hidden_from_repr():
+    s = Settings(gmail_client_id="cid", gmail_client_secret="topsecret", gmail_refresh_token="1//refresh")
+    assert "topsecret" not in repr(s) and "1//refresh" not in repr(s)
+
+
+def test_auth_writes_token_to_env_file(tmp_path):
+    from mailtool.gmail_auth import _set_env_value
+
+    env = tmp_path / ".env"
+    env.write_text("IMAP_USER=a@b.com\nGMAIL_REFRESH_TOKEN=old\n")
+    _set_env_value(env, "GMAIL_REFRESH_TOKEN", "new")
+    assert env.read_text() == "IMAP_USER=a@b.com\nGMAIL_REFRESH_TOKEN=new\n"
+    assert env.stat().st_mode & 0o077 == 0

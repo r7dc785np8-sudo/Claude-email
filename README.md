@@ -1,12 +1,23 @@
 # Gmail document reader (read-only)
 
-A small command-line tool. It connects to Gmail over IMAP in **read-only** mode, searches emails, saves their attachments by date and pulls out the text of PDF, Excel (`.xlsx`, `.xls`) and Word (`.docx`) files, with OCR for scanned PDF pages. It can also summarize each document in Egyptian Arabic.
+A small command-line tool. It connects to Gmail in **read-only** mode, over IMAP or the Gmail API, searches emails, saves their attachments by date and pulls out the text of PDF, Excel (`.xlsx`, `.xls`) and Word (`.docx`) files, with OCR for scanned PDF pages. It can also summarize each document in Egyptian Arabic.
 
-There's no size limit: attachments come straight from Gmail to your Mac, so large reports such as the night reports download in full.
+There's no size limit: attachments come straight from Gmail, so large reports such as the night reports and the B.O.B. report download in full.
+
+There are two ways to connect:
+
+| | IMAP (App Password) | Gmail API (OAuth) |
+|---|---|---|
+| Works on | your Mac | your Mac **and** Claude cloud sessions (HTTPS only) |
+| Access | full mailbox; the tool enforces read-only | `gmail.readonly`: Google itself blocks any change |
+| Setup | App Password | a small Google Cloud project, one sign-in |
+
+With `--backend auto` (the default), the tool uses the Gmail API when `GMAIL_REFRESH_TOKEN` is set, and IMAP otherwise.
 
 ## Safety
 
-- **Encrypted connection:** it uses IMAP over SSL only (`imap.gmail.com:993`) and checks Google's certificate.
+- **Encrypted connection:** it uses IMAP over SSL only (`imap.gmail.com:993`) or HTTPS for the Gmail API, and checks Google's certificate.
+- **Read-only Gmail API token:** the token only has the `gmail.readonly` scope; the tool refuses a token with more access and only sends GET requests to Gmail.
 - **Read-only mailbox:** the mailbox is opened with `EXAMINE`, never `SELECT`, so Gmail itself refuses any change.
 - **Emails stay unread:** messages are fetched with `BODY.PEEK[]`, which doesn't mark them as read.
 - **Changes are blocked in the code too:** commands that move, copy, delete, flag or expunge are refused before they reach Gmail (see `mailtool/imap_client.py`).
@@ -35,6 +46,24 @@ open -e .env        # paste your App Password (and an Anthropic API key if you w
 
 Before this works, Gmail needs IMAP enabled, 2-Step Verification turned on and an App Password created at https://myaccount.google.com/apppasswords. Your Workspace admin must also allow IMAP and App Passwords.
 
+## Gmail API setup (one time, optional)
+
+Needed to use the tool from Claude cloud sessions, where IMAP is blocked. Done once, by you or your IT admin.
+
+1. **Project:** open https://console.cloud.google.com, signed in as your Workspace account, and create a project (e.g. "Sunny Days Mail Reader").
+2. **Gmail API:** *APIs & Services → Library → Gmail API → Enable*.
+3. **Consent screen:** *Google Auth Platform → Branding*. Enter an app name and support email, and under *Audience* choose **Internal**, so only your organization can use it.
+4. **Scope:** under *Data Access → Add or remove scopes*, add only `.../auth/gmail.readonly`.
+5. **Client:** *Clients → Create client → Desktop app*. Copy the Client ID and Client secret into `.env` as `GMAIL_CLIENT_ID` and `GMAIL_CLIENT_SECRET`.
+6. **Sign in once on the Mac:**
+   ```bash
+   python mail_tool.py auth
+   ```
+   This opens Google's sign-in page and saves `GMAIL_REFRESH_TOKEN` to `.env`. It's never printed.
+7. **Cloud sessions:** add the same three values as environment variables in the Claude cloud environment's settings. A new session picks them up.
+
+If sign-in says the app is blocked, your Workspace admin needs to allow it under *Admin console → Security → Access and data control → API controls*.
+
 ## Usage
 
 Run `source .venv/bin/activate` in each new Terminal window first.
@@ -54,6 +83,10 @@ python mail_tool.py fetch --subject "Night reports" --days 1 --summarize
 
 # Every document that arrived today
 python mail_tool.py fetch --days 1 --summarize
+
+# Gmail API only: any Gmail search, or one exact message
+python mail_tool.py fetch --query "has:attachment larger:5M" --days 7
+python mail_tool.py fetch --id 1a1691e21e96a148 --summarize
 
 # Other filters
 python mail_tool.py search --from exec.secretary@sunnydaysegypt.com --since 2026-10-01 --before 2026-10-15
