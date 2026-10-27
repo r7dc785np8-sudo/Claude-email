@@ -122,7 +122,7 @@ def _msg_with(*attachments):
 def test_save_attachments_by_date_pdf_only(tmp_path):
     msg = _msg_with(("../min.pdf", b"%PDF-1.5 a", "application", "pdf"),
                     ("logo.png", b"\x89PNG", "image", "png"))
-    saved = save_attachments(msg, date(2026, 10, 22), tmp_path, pdf_only=True)
+    saved = save_attachments(msg, date(2026, 10, 22), tmp_path, documents_only=True)
     assert [s.path for s in saved] == [tmp_path / "2026-10-22" / "min.pdf"]
     assert saved[0].path.read_bytes() == b"%PDF-1.5 a"
 
@@ -156,3 +156,172 @@ def test_good_arabic_is_not_garbled():
 def test_broken_text_layer_is_garbled():
     text = "ضورة توفن صندوق إسعافات أولية يف جميع المطاعم والبارات مع إعطاء هذا األمر أهمية قصوى " * 2
     assert looks_garbled_arabic(text.replace("مع", "مغ"))
+
+
+# --- Excel / Word -------------------------------------------------------
+
+def _make_xlsx(path):
+    import datetime as dt
+    import openpyxl
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "22.10"
+    ws.append(["Hotel", "Occupancy", "Date"])
+    ws.append(["El Palacio", 99.75, dt.datetime(2026, 10, 22)])
+    ws.append([None, None, None])
+    ws.append(["Palma", 78, None])
+    wb.create_sheet("23.10").append(["ميريت", "85%"])
+    wb.save(path)
+
+
+def test_extract_xlsx_all_sheets(tmp_path):
+    from mailtool.office_extract import extract_office
+
+    path = tmp_path / "report.xlsx"
+    _make_xlsx(path)
+    text = extract_office(path)
+    assert "===== Sheet: 22.10 (3 rows) =====" in text
+    assert "El Palacio\t99.75\t2026-10-22" in text
+    assert "Palma\t78" in text.splitlines()
+    assert "ميريت\t85%" in text
+
+
+def test_xls_name_with_xlsx_content_is_read(tmp_path):
+    from mailtool.office_extract import extract_office
+
+    path = tmp_path / "Competition Analysis.xls"
+    _make_xlsx(path)
+    assert "El Palacio" in extract_office(path)
+
+
+def test_extract_docx_keeps_tables_in_order(tmp_path):
+    import docx
+    from mailtool.office_extract import extract_office
+
+    document = docx.Document()
+    document.add_paragraph("Duty Manager Incident Log 22/10/2026")
+    table = document.add_table(rows=2, cols=3)
+    for cell, value in zip(table.rows[0].cells, ["Time", "Room", "Incident"]):
+        cell.text = value
+    for cell, value in zip(table.rows[1].cells, ["23:40", "1204", "Guest\nlocked out"]):
+        cell.text = value
+    document.add_paragraph("Signed: Night Manager")
+    path = tmp_path / "log.docx"
+    document.save(path)
+
+    text = extract_office(path)
+    assert text.index("Incident Log") < text.index("[table]") < text.index("Signed")
+    assert "23:40\t1204\tGuest locked out" in text
+
+
+def test_save_attachments_keeps_office_documents(tmp_path):
+    msg = _msg_with(
+        ("sheet.xlsx", b"PK..", "application", "vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        ("old.xls", b"\xd0\xcf..", "application", "vnd.ms-excel"),
+        ("log.docx", b"PK..", "application", "vnd.openxmlformats-officedocument.wordprocessingml.document"),
+        ("logo.png", b"\x89PNG", "image", "png"),
+    )
+    saved = save_attachments(msg, date(2026, 10, 23), tmp_path, documents_only=True)
+    assert sorted(s.path.name for s in saved) == ["log.docx", "old.xls", "sheet.xlsx"]
+
+
+# --- Gmail API backend ----------------------------------------------------
+
+import base64 as _b64
+import io as _io
+import json as _json
+
+
+def test_gmail_query_from_filters():
+    from mailtool.gmail_api import build_query
+
+    q = build_query(SearchCriteria(sender="reservation.elpalacio@sunnydaysegypt.com",
+                                   subject="Daily B.O.B.", since=date(2026, 10, 23)),
+                    raw_query="has:attachment")
+    assert q == ('in:inbox from:(reservation.elpalacio@sunnydaysegypt.com) '
+                 'subject:("Daily B.O.B.") after:2026/10/22 has:attachment')
+
+
+def test_gmail_query_all_mail_and_before():
+    from mailtool.gmail_api import build_query
+
+    q = build_query(SearchCriteria(before=date(2026, 10, 1)), mailbox="[Gmail]/All Mail")
+    assert q == "before:2026/10/01"
+
+
+def _api_settings():
+    return Settings(gmail_client_id="cid", gmail_client_secret="csecret", gmail_refresh_token="rtoken")
+
+
+class _FakeGoogle:
+    """Answers the three Gmail calls the reader makes; records every request."""
+
+    def __init__(self, raw_message: bytes, scope="https://www.googleapis.com/auth/gmail.readonly"):
+        self.requests = []
+        self.raw = raw_message
+        self.scope = scope
+
+    def __call__(self, req, timeout=None):
+        self.requests.append(req)
+        url = req.full_url
+        if url.startswith("https://oauth2.googleapis.com/token"):
+            body = {"access_token": "atoken", "scope": self.scope}
+        elif "/messages?" in url:
+            body = {"messages": [{"id": "new"}, {"id": "old"}]}
+        elif url.endswith("format=raw"):
+            body = {"raw": _b64.urlsafe_b64encode(self.raw).decode().rstrip("=")}
+        else:
+            raise AssertionError(url)
+        return _io.BytesIO(_json.dumps(body).encode())
+
+
+def test_gmail_api_reader_downloads_large_attachment(monkeypatch, tmp_path):
+    from mailtool.gmail_api import GmailApiReader
+
+    big = b"%PDF-1.5 " + b"x" * (12 * 2**20)  # bigger than the chat connector can carry
+    raw = _msg_with(("BOB report Vs. Last Year 2026.xls", big, "application", "vnd.ms-excel")).as_bytes()
+    google = _FakeGoogle(raw)
+    monkeypatch.setattr("urllib.request.urlopen", google)
+
+    with GmailApiReader(_api_settings()) as reader:
+        ids = reader.search(SearchCriteria(subject="B.O.B", days=1), limit=10)
+        assert ids == ["old", "new"]  # oldest first, like IMAP
+        msg = reader.fetch("new")
+    saved = save_attachments(msg, date(2026, 10, 23), tmp_path, documents_only=True)
+    assert saved[0].path.read_bytes() == big
+    # Read-only: every Gmail call is a GET; only the token exchange POSTs.
+    gmail_calls = [r for r in google.requests if "gmail.googleapis.com" in r.full_url]
+    assert gmail_calls and all(r.get_method() == "GET" for r in gmail_calls)
+
+
+def test_gmail_api_rejects_token_with_write_scope(monkeypatch):
+    from mailtool.gmail_api import GmailApiReader
+
+    monkeypatch.setattr("urllib.request.urlopen",
+                        _FakeGoogle(b"", scope="https://www.googleapis.com/auth/gmail.modify"))
+    with pytest.raises(PermissionError):
+        GmailApiReader(_api_settings()).__enter__()
+
+
+def test_gmail_api_needs_credentials():
+    from mailtool.config import ConfigError
+    from mailtool.gmail_api import GmailApiReader
+
+    with pytest.raises(ConfigError):
+        GmailApiReader(Settings())
+
+
+def test_api_secrets_hidden_from_repr():
+    s = Settings(gmail_client_id="cid", gmail_client_secret="topsecret", gmail_refresh_token="1//refresh")
+    assert "topsecret" not in repr(s) and "1//refresh" not in repr(s)
+
+
+def test_auth_writes_token_to_env_file(tmp_path):
+    from mailtool.gmail_auth import _set_env_value
+
+    env = tmp_path / ".env"
+    env.write_text("IMAP_USER=a@b.com\nGMAIL_REFRESH_TOKEN=old\n")
+    _set_env_value(env, "GMAIL_REFRESH_TOKEN", "new")
+    assert env.read_text() == "IMAP_USER=a@b.com\nGMAIL_REFRESH_TOKEN=new\n"
+    assert env.stat().st_mode & 0o077 == 0

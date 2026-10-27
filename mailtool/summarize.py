@@ -1,7 +1,8 @@
-"""Summarize a PDF in Egyptian Arabic with the Claude API.
+"""Summarize documents in Egyptian Arabic with the Claude API.
 
-The PDF itself is sent (not just extracted text) because Claude reads the page
+PDFs are sent as-is (not just extracted text) because Claude reads the page
 images too, which handles scanned pages and broken Arabic text layers.
+Excel and Word files are sent as the text extracted from them.
 """
 
 from __future__ import annotations
@@ -15,6 +16,8 @@ from .config import ConfigError, Settings
 
 MODEL = "claude-opus-5-5"
 MAX_PDF_BYTES = 30 * 1024 * 1024
+# Roughly 150-250k tokens; anything longer is cut and the summary says so.
+MAX_TEXT_CHARS = 500_000
 
 SYSTEM_PROMPT = """\
 انت مساعد تنفيذي بتلخّص مستندات شغل (محاضر اجتماعات، تقارير، خطابات) لـ {name}، {role}.
@@ -39,27 +42,58 @@ def summarize_pdf(path: Path, settings: Settings, email_subject: str = "") -> st
     data = path.read_bytes()
     if len(data) > MAX_PDF_BYTES:
         raise ValueError(f"{path.name} is too large to summarize ({len(data) // 2**20} MB)")
+    document = {
+        "type": "document",
+        "source": {
+            "type": "base64",
+            "media_type": "application/pdf",
+            "data": base64.standard_b64encode(data).decode("ascii"),
+        },
+    }
+    request = f"لخّص المستند ده. عنوان الإيميل: {email_subject or '(غير معروف)'}، اسم الملف: {path.name}"
+    return _summarize(settings, [document, {"type": "text", "text": request}], path.name)
 
+
+def summarize_text(path: Path, text: str, settings: Settings, email_subject: str = "") -> str:
+    """Summarize the extracted text of an Excel or Word file."""
+    truncated = len(text) > MAX_TEXT_CHARS
+    if truncated:
+        print(f"  warning: {path.name} is very long; only the first {MAX_TEXT_CHARS:,} characters are summarized")
+        text = text[:MAX_TEXT_CHARS]
+    kind = "جدول Excel (كل شيت مفصول، والخلايا مفصولة بـ Tab)" if path.suffix.lower() != ".docx" else "مستند Word"
+    request = (
+        f"لخّص الملف ده. ده {kind}. عنوان الإيميل: {email_subject or '(غير معروف)'}، اسم الملف: {path.name}.\n"
+        "لو الملف شهري وفيه أيام كتير، ركّز على أحدث يوم فيه وقارنه باليوم اللي قبله."
+    )
+    if truncated:
+        request += "\nالملف طويل واتقطع، فقول في أول الملخص إنه مبني على جزء من الملف بس."
+    document = {
+        "type": "document",
+        "source": {"type": "text", "media_type": "text/plain", "data": text},
+        "title": path.name,
+    }
+    return _summarize(settings, [document, {"type": "text", "text": request}], path.name)
+
+
+def _summarize(settings: Settings, content: list[dict], name: str) -> str:
     client = anthropic.Anthropic(api_key=settings.anthropic_api_key) if settings.anthropic_api_key \
         else anthropic.Anthropic()
-    request = f"لخّص المستند ده. عنوان الإيميل: {email_subject or '(غير معروف)'}، اسم الملف: {path.name}"
-
     try:
-        message = _request(client, settings, data, request)
+        message = _request(client, settings, content)
     except TypeError as exc:
         if "authentication" in str(exc):  # no API key and no `ant auth login` profile
             raise ConfigError("set ANTHROPIC_API_KEY in .env to use summaries") from None
         raise
 
     if message.stop_reason == "refusal":
-        raise RuntimeError(f"Claude declined to summarize {path.name}")
+        raise RuntimeError(f"Claude declined to summarize {name}")
     text = "".join(block.text for block in message.content if block.type == "text").strip()
     if message.stop_reason == "max_tokens":
         text += "\n\n(الملخص اتقطع لأنه طويل جداً)"
     return text
 
 
-def _request(client: anthropic.Anthropic, settings: Settings, data: bytes, request: str):
+def _request(client: anthropic.Anthropic, settings: Settings, content: list[dict]):
     with client.beta.messages.stream(
         model=MODEL,
         max_tokens=16000,
@@ -68,19 +102,6 @@ def _request(client: anthropic.Anthropic, settings: Settings, data: bytes, reque
         betas=["server-side-fallback-2026-07-01"],
         fallbacks="default",
         system=SYSTEM_PROMPT.format(name=settings.my_name, role=settings.my_role),
-        messages=[{
-            "role": "user",
-            "content": [
-                {
-                    "type": "document",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "application/pdf",
-                        "data": base64.standard_b64encode(data).decode("ascii"),
-                    },
-                },
-                {"type": "text", "text": request},
-            ],
-        }],
+        messages=[{"role": "user", "content": content}],
     ) as stream:
         return stream.get_final_message()
